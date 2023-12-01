@@ -12,7 +12,7 @@ class GCNClassifier(nn.Module):
         self.args = args
         self.gcn_model = GCNAbsaModel(args, emb_matrix=emb_matrix)
         # in_dim, shape[50]
-        self.classifier = nn.Linear(in_dim, args.num_class)
+        self.classifier = nn.Linear(in_dim*4, args.num_class)
 
     def forward(self, inputs):
         # outputs,shape[batch_size=32,hidden_size=50]
@@ -61,20 +61,22 @@ class GCNAbsaModel(nn.Module):
         adj = inputs_to_tree_reps(head.data, tok.data, l.data)
         # input,list[8]: from tok to l
         # h,shape[batch=32,seq_len=41,hidden_dim=50]
-        h = self.gcn(adj, inputs)
+        h, bi_LSTM_output = self.gcn(adj, inputs)
         
-        # avg pooling asp feature   todo 平均池化
+        # avg pooling asp feature   todo mask+平均池化
         # asp_wn,shape[batch_size=32, 1]
         asp_wn = mask.sum(dim=1).unsqueeze(-1)                        # aspect words num
         # 输入mask,shape[batch_size=32, seq_len=41]   self.args.hidden_dim=50
         # 输出mask,shape[batch_size=32, seq_len=41, hidden_dim=50]
         # repeat方法用于沿指定维度上重复张量的元素  在dim=0,1上重复1次，形状不变  在dim=2上重复50次
         # 重复操作只会复制原始张量中的元素，并按照指定的重复次数在对应的维度上进行复制
-        mask = mask.unsqueeze(-1).repeat(1,1,self.args.hidden_dim)    # mask for h
+        mask = mask.unsqueeze(-1).repeat(1,1,self.args.hidden_dim*2)    # mask for h
         # outputs, shape[batch_size=32, hidden_num=50]
         outputs = (h*mask).sum(dim=1) / asp_wn                        # mask h
+
+        final_output = torch.cat((bi_LSTM_output, outputs), dim=1) # todo 拼接 bi_LSTM_output, gcn_outputs
         
-        return outputs
+        return final_output
 
 class GCN(nn.Module):
     def __init__(self, args, embeddings, mem_dim, num_layers):
@@ -104,8 +106,8 @@ class GCN(nn.Module):
         # 迭代 self.layers 次，为每一层创建一个 nn.Linear 模块，并将其添加到 self.W 中
         # 在后续的图卷积层计算中，可以通过索引访问 self.W 中的权重矩阵
         for layer in range(self.layers):
-            input_dim = self.in_dim if layer == 0 else self.mem_dim
-            self.W.append(nn.Linear(input_dim, self.mem_dim))
+            input_dim = self.in_dim # if layer == 0 else self.mem_dim todo 更改gcn层维度
+            self.W.append(nn.Linear(input_dim, self.mem_dim*2))
 
     """利用 LSTM 对输入序列进行编码，并返回编码后的序列"""   # todo Bi-LSTM输出h
     # rnn_inputs[batch_size=32,seq_len,emb_dim+pos_dim+post_dim=360]   seq_lens[batch_size=32]
@@ -143,9 +145,22 @@ class GCN(nn.Module):
 
         # rnn layer
         # embs, shape[batch_size=32,seq_len=41,emb_size=360]   l, shape[batch_size=32,]   tok.size()[0]==batch_size, shape==32
-        # gcn_inputs, shape[batch=32,len=41,2*rnn_hidden=100]
+        # gcn_inputs, shape[batch=32,len=41,2*rnn_hidden=100]   这里的gcn_inputs=rnn_outputs
         gcn_inputs = self.rnn_drop(self.encode_with_rnn(embs, l, tok.size()[0]))
-        
+
+
+        # todo 任务1：Bi-LSTM表示mask+avgpool
+        # input: mask[batch_size=32, seq_len=41]
+        # output: asp_wn[batch_size=32, 1]
+        asp_wn = mask.sum(dim=1).unsqueeze(-1)      # aspect word num
+        # input: mask[batch_size=32, seq_len=41]
+        # output: mask[batch_size=32, seq_len=41, hidden_dim=rnn_hidden*2=100]
+        mask = mask.unsqueeze(-1).repeat(1, 1, self.args.rnn_hidden*2)
+        # input: gcn_inputs[batch=32,len=41,2*rnn_hidden=100]   mask[batch_size=32, seq_len=41, hidden_dim=rnn_hidden*2=100]
+        # output: bi_LSTM_output[batch=32, hidden_dim=100]
+        bi_LSTM_output = (gcn_inputs*mask).sum(dim=1) / asp_wn  # mask
+
+
         # gcn layer
         # adj[batch_size=32,seq_len=41,seq_len=41]
         # sum(2)是对第三个维度求和，结果的维度为shape[32,41]
@@ -163,7 +178,7 @@ class GCN(nn.Module):
             gAxW = F.relu(AxW)
             gcn_inputs = self.gcn_drop(gAxW) if l < self.layers - 1 else gAxW   # 最后一层不丢弃神经元
 
-        return gcn_inputs
+        return gcn_inputs, bi_LSTM_output
 
 """生成 LSTM 的初始隐藏状态和细胞状态"""
 def rnn_zero_state(batch_size, hidden_dim, num_layers, bidirectional=True):
